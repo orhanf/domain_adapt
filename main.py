@@ -26,13 +26,15 @@ class ReverseGradient(theano.gof.Op):
         return [-self.hp_lambda * output_gradients[0]]
 
 
-def init_param(inp_size, out_size):
+def init_param(inp_size, out_size, name):
     return theano.shared(
-        np.random.randn(inp_size, out_size).astype(floatX))
+        np.random.randn(inp_size, out_size).astype(floatX),
+        name=_g(name, 'W'))
 
 
-def init_bias(layer_size):
-    return theano.shared(np.zeros(layer_size, dtype=floatX))
+def init_bias(layer_size, name):
+    return theano.shared(np.zeros(layer_size, dtype=floatX),
+                         name=_g(name, 'b'))
 
 
 def g_f(z, theta_f):
@@ -65,23 +67,28 @@ def l_d(z, d):
     return tt.nnet.binary_crossentropy(z, d).mean()
 
 
-def mlp_parameters(input_size, layer_sizes):
+def _g(p, q):
+    return '{}_{}'.format(p, q)
+
+
+def mlp_parameters(input_size, layer_sizes, name=None):
     parameters = []
     previous_size = input_size
-    for layer_size in layer_sizes:
+    for i, layer_size in enumerate(layer_sizes):
         parameters.append(
-            (init_param(previous_size, layer_size), init_bias(layer_size)))
+            (init_param(previous_size, layer_size, name=_g(name, i)),
+             init_bias(layer_size, name=_g(name, i))))
         previous_size = layer_size
     return parameters, previous_size
 
 
-def compile(input_size, f_layer_sizes, y_layer_sizes, d_layer_sizes,
-            hp_lambda, hp_mu):
+def build_model(input_size, f_layer_sizes, y_layer_sizes, d_layer_sizes,
+                hp_lambda, hp_mu):
     r = ReverseGradient(hp_lambda)
 
-    theta_f, f_size = mlp_parameters(input_size, f_layer_sizes)
-    theta_y, _ = mlp_parameters(f_size, y_layer_sizes)
-    theta_d, _ = mlp_parameters(f_size, d_layer_sizes)
+    theta_f, f_size = mlp_parameters(input_size, f_layer_sizes, 'f')
+    theta_y, _ = mlp_parameters(f_size, y_layer_sizes, 'y')
+    theta_d, _ = mlp_parameters(f_size, d_layer_sizes, 'd')
 
     xs = tt.matrix('xs')
     xs.tag.test_value = np.random.randn(9, input_size).astype(floatX)
@@ -91,13 +98,19 @@ def compile(input_size, f_layer_sizes, y_layer_sizes, d_layer_sizes,
     ys.tag.test_value = np.random.randint(
         y_layer_sizes[-1], size=9).astype(np.int32)
 
+    if approach:
     fs = g_f(xs, theta_f)
-    e = l_y(g_y(fs, theta_y), ys) + \
+    e = l_y(g_y(fs, theta_y), ys) + \   #
         l_d(g_d(r(fs), theta_d), 0) +\
         l_d(g_d(r(g_f(xt, theta_f)), theta_d), 1)
+    else:
+    e.name = 'cost'
 
-    updates = [(p, p - hp_mu * theano.grad(e, p))
-               for theta in theta_f + theta_y + theta_d for p in theta]
+    thetas = [p for theta in theta_f + theta_y + theta_d for p in theta]
+    grads = [theano.grad(e, p) for p in thetas]
+
+    import ipdb;ipdb.set_trace()
+    updates = [(p, p - hp_mu * g) for p, g in zip(thetas, grads)]
     train = theano.function([xs, xt, ys], outputs=e, updates=updates)
 
     return train
