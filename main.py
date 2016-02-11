@@ -11,16 +11,15 @@ def init_param(inp_size, out_size, name, scale=0.01, ortho=False):
         W = u.astype('float32')
     else:
         W = scale * np.random.randn(inp_size, out_size).astype(floatX)
-    return theano.shared(W, name=_g(name, 'W'))
+    return theano.shared(W, name=name)
 
 
 def init_bias(layer_size, name):
-    return theano.shared(np.zeros(layer_size, dtype=floatX),
-                         name=_g(name, 'b'))
+    return theano.shared(np.zeros(layer_size, dtype=floatX), name=name)
 
 
-def _p(p, q):
-    return '{}_{}'.format(p, q)
+def _p(p, q, r):
+    return '{}_{}_{}'.format(p, q, r)
 
 
 class ReverseGradient(theano.gof.Op):
@@ -52,118 +51,115 @@ class ReverseGradient(theano.gof.Op):
 
 class DenseLayer(object):
     def __init__(self, nin, dim, activ='lambda x: tensor.tanh(x)', prefix='ff',
-                 scale=0.01, ortho=False, **kwargs):
-        self.nin = nin
-        self.dim = dim
+                 postfix='0', scale=0.01, ortho=False, add_bias=True):
         self.activ = activ
-        self.prefix = prefix
-        self.W = None
-        self.b = None
-
-    def init(self, add_bias=True):
-        self.W = init_param(self.nin, self.dim, _p(self.prefix, 'W'),
-                            scale=self.scale, ortho=self.ortho)
+        self.add_bias = add_bias
+        self.W = init_param(nin, dim, _p(prefix, 'W', postfix),
+                            scale=scale, ortho=ortho)
         if add_bias:
-            self.b = init_bias(self.dim, _p(self.prefix, 'b'))
+            self.b = init_bias(dim, _p(prefix, 'b', postfix))
 
     def fprop(self, state_below):
         pre_act = tensor.dot(state_below, self.W) + \
-            (self.b if self.b is not None else 0.)
+            (self.b if self.add_bias else 0.)
         return eval(self.activ)(pre_act)
 
     def get_params(self):
-        return [self.W] + ([self.b] if self.b is not None else [])
+        return [self.W] + ([self.b] if self.add_bias else [])
 
 
-def g_f(z, theta_f):
-    for w_f, b_f in theta_f:
-        z = tensor.tanh(theano.dot(z, w_f) + b_f)
-    return z
+class MultiLayer(object):
+    def __init__(self, nin, dims, **kwargs):
+        self.layers = []
+        for i, dim in enumerate(dims):
+            self.layers.append(DenseLayer(nin, dim, postfix=i, **kwargs))
+            nin = dim
+
+    def fprop(self, inp):
+        for i, layer in enumerate(self.layers):
+            inp = layer.fprop(inp)
+        return inp
+
+    def get_params(self):
+        params = []
+        for layer in self.layers:
+            params += layer.get_params()
+        return params
 
 
-def g_y(z, theta_y):
-    for w_y, b_y in theta_y[:-1]:
-        z = tensor.tanh(theano.dot(z, w_y) + b_y)
-    w_y, b_y = theta_y[-1]
-    z = tensor.nnet.softmax(theano.dot(z, w_y) + b_y)
-    return z
+def build_model(xs, xt, ys, hp_lambda, hp_mu,
+                input_dim, f_layer_dims, y_layer_dims, d_layer_dims):
+    r = ReverseGradient()  # our guy
 
+    g_f = MultiLayer(input_dim, f_layer_dims)  # feature func
+    g_d = MultiLayer(f_layer_dims[-1], d_layer_dims)  # domain classifier
+    g_y = MultiLayer(f_layer_dims[-1], y_layer_dims)  # label classifier
 
-def g_d(z, theta_d):
-    for w_d, b_d in theta_d[:-1]:
-        z = tensor.tanh(theano.dot(z, w_d) + b_d)
-    w_d, b_d = theta_d[-1]
-    z = tensor.nnet.sigmoid(theano.dot(z, w_d) + b_d)
-    return z
+    fs = g_f.fprop(xs)
+    ft = g_f.fprop(xt)
 
+    ys_probs = tensor.nnet.softmax(g_y.fprop(fs))
+    yt_prob0 = tensor.nnet.sigmoid(g_d.fprop(r(fs)))
+    yt_prob1 = tensor.nnet.sigmoid(g_d.fprop(r(ft)))
 
-def l_y(z, y):
-    return tensor.nnet.categorical_crossentropy(z, y).mean()
+    cost_ys = tensor.nnet.categorical_crossentropy(ys_probs, ys).mean()
+    cost_yt = tensor.nnet.binary_crossentropy(yt_prob0, 0.).mean() + \
+        tensor.nnet.binary_crossentropy(yt_prob1, 1.).mean()
+    cost = cost_ys + hp_lambda * cost_yt
+    cost.name = 'cost'
 
+    params = g_f.get_params() + g_d.get_params() + g_y.get_params()
 
-def l_d(z, d):
-    return tensor.nnet.binary_crossentropy(z, d).mean()
+    grads = [theano.grad(cost, p) for p in params]
+    updates = [(p, p - hp_mu * g) for p, g in zip(params, grads)]
 
-
-def _g(p, q):
-    return '{}_{}'.format(p, q)
-
-
-def mlp_parameters(input_size, layer_sizes, name=None):
-    parameters = []
-    previous_size = input_size
-    for i, layer_size in enumerate(layer_sizes):
-        parameters.append(
-            (init_param(previous_size, layer_size, name=_g(name, i)),
-             init_bias(layer_size, name=_g(name, i))))
-        previous_size = layer_size
-    return parameters, previous_size
-
-
-def build_model(xs, xt, ys, input_size, hp_lambda, hp_mu,
-                f_layer_sizes, y_layer_sizes, d_layer_sizes,
-                simple=False):
-    r = ReverseGradient(hp_lambda)
-
-    theta_f, f_size = mlp_parameters(input_size, f_layer_sizes, 'f')
-    theta_y, _ = mlp_parameters(f_size, y_layer_sizes, 'y')
-    theta_d, _ = mlp_parameters(f_size, d_layer_sizes, 'd')
-
-    if simple:
-        fs = g_f(xs, theta_f)
-        e = l_y(g_y(fs, theta_y), ys) + \
-            l_d(g_d(r(fs), theta_d), 0) + \
-            l_d(g_d(r(g_f(xt, theta_f)), theta_d), 1)
-    else:
-        pass
-
-    e.name = 'cost'
-
-    thetas = [p for theta in theta_f + theta_y + theta_d for p in theta]
-    grads = [theano.grad(e, p) for p in thetas]
-
-    updates = [(p, p - hp_mu * g) for p, g in zip(thetas, grads)]
-    train = theano.function([xs, xt, ys], outputs=e, updates=updates)
-
-    return train
+    return cost, cost_ys, cost_yt, params, grads, updates
 
 
 def main():
-    theano.config.compute_test_value = 'raise'
+    # spawn theano vars
     xs = tensor.matrix('xs')
     xt = tensor.matrix('xt')
     ys = tensor.ivector('ys')
     hp_lambda = tensor.scalar('hp_lambda')
     hp_mu = tensor.scalar('hp_mu')
-    xs.tag.test_value = np.random.randn(9, 2).astype(floatX)
-    xt.tag.test_value = np.random.randn(10, 2).astype(floatX)
-    ys.tag.test_value = np.random.randint(8, size=9).astype(np.int32)
+
+    # use test values
+    batch_size = 10
+    theano.config.compute_test_value = 'raise'
+    xs.tag.test_value = np.random.randn(batch_size, 2).astype(floatX)
+    xt.tag.test_value = np.random.randn(batch_size, 2).astype(floatX)
+    ys.tag.test_value = np.random.randint(8, size=batch_size).astype(np.int32)
+    hp_lambda.tag.test_value = 0.5
+    hp_mu.tag.test_value = 1.
     np.random.seed(4321)
 
-    build_model(xs, xt, ys, hp_lambda, hp_mu,
-                input_size=2, f_layer_sizes=[3, 4], y_layer_sizes=[7, 8],
-                d_layer_sizes=[5, 6])
+    # build cgs
+    cost, cost_l, cost_d, param, grad, updates = build_model(
+        xs, xt, ys, hp_lambda, hp_mu,
+        input_dim=2, f_layer_dims=[3, 4], y_layer_dims=[7, 8],
+        d_layer_dims=[5, 6])
 
+    # compile
+    train = theano.function(inputs=[xs, xt, ys, hp_mu, hp_lambda],
+                            outputs=[cost, cost_l, cost_d],
+                            updates=updates)
+
+    # training loop
+    niter = 1000
+    ps = np.linspace(0, 1, num=niter).astype(floatX)
+    learning_rate = np.float32(1.)
+    gamma = 10.
+    for i in range(niter):
+        xs_ = np.random.randn(batch_size, 2).astype(floatX)
+        xt_ = np.random.randn(batch_size, 2).astype(floatX)
+        ys_ = np.random.randint(8, size=batch_size).astype(np.int32)
+
+        lambda_p = np.float32(2. / (1. + np.exp(-gamma * ps[i])) - 1.)
+
+        c, cl, cd = train(xs_, xt_, ys_, learning_rate, lambda_p)
+        print('iter: {} - cost: {} [label: {} domain: {}] - lambda_p: {}'
+              .format(i, c, cl, cd, lambda_p))
 
 if __name__ == "__main__":
     main()
